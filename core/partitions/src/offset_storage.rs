@@ -190,6 +190,32 @@ pub async fn persist_offset_retained(
     Ok((result, file))
 }
 
+/// Why writing a consumer offset file failed, and whether the WAL has to be
+/// fenced because of it.
+///
+/// Only classify errors from the write in [`persist_offset_retained`]. A
+/// failed sync always fences the WAL, even when it reports a full disk,
+/// because a failed `fdatasync` can lose earlier writes to the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffsetWriteFailure {
+    /// The disk or the quota is full, so the kernel rejected the write. The op
+    /// isn't marked as applied yet, so the WAL keeps it and recovery writes the
+    /// offset again.
+    Refused,
+    /// Any other error. We can't tell what reached the file, or whether
+    /// earlier writes to it were lost, so the WAL has to stay fenced.
+    Ambiguous,
+}
+
+impl From<&io::Error> for OffsetWriteFailure {
+    fn from(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => Self::Refused,
+            _ => Self::Ambiguous,
+        }
+    }
+}
+
 async fn write_in_place<S: DurableStorage, const N: usize>(
     storage: &S,
     path: &str,
@@ -585,6 +611,32 @@ mod tests {
                 checksummed: false
             }
         );
+    }
+
+    #[test]
+    fn offset_write_failure_is_refused_only_for_lack_of_space_or_quota() {
+        const EIO: i32 = 5;
+        let cases = [
+            (
+                io::Error::from(io::ErrorKind::StorageFull),
+                OffsetWriteFailure::Refused,
+            ),
+            (
+                io::Error::from(io::ErrorKind::QuotaExceeded),
+                OffsetWriteFailure::Refused,
+            ),
+            (
+                io::Error::from_raw_os_error(EIO),
+                OffsetWriteFailure::Ambiguous,
+            ),
+            (
+                io::Error::from(io::ErrorKind::WriteZero),
+                OffsetWriteFailure::Ambiguous,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(OffsetWriteFailure::from(&error), expected, "{error}");
+        }
     }
 
     #[test]

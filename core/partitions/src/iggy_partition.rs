@@ -24,9 +24,9 @@ use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
-    PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
-    persist_offset, persist_offset_max, persist_purge_generation_with_storage,
-    read_purge_generation,
+    OffsetWriteFailure, PURGE_GENERATION_FILE, delete_persisted_offset,
+    delete_persisted_offset_with_storage, persist_offset, persist_offset_max,
+    persist_purge_generation_with_storage, read_purge_generation,
 };
 use crate::persistence::{
     CheckpointBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
@@ -2764,22 +2764,41 @@ where
         offset: u64,
         persisted: bool,
     ) -> Result<(), IggyError> {
-        if let Some(persistence) = &self.persistence {
-            let (result, file) = crate::offset_storage::persist_offset_retained(
-                path,
-                offset,
-                persistence.take_offset_file(path),
-            )
-            .await?;
-            let result = result.and(persistence.retain_offset_file(path.to_owned(), file).await);
-            result.map_err(|error| {
-                // Unlike WAL admission, a failed write can leave a partial record.
-                persistence.fail_operation(error, Operation::StoreConsumerOffset);
-                IggyError::CannotWriteToFile
-            })
-        } else {
-            persist_offset(path, offset, persisted).await
+        let Some(persistence) = &self.persistence else {
+            return persist_offset(path, offset, persisted).await;
+        };
+        let (offset_written_result, file) = crate::offset_storage::persist_offset_retained(
+            path,
+            offset,
+            persistence.take_offset_file(path),
+        )
+        .await?;
+
+        // If the sync failed, the WAL has to stay fenced
+        // even when the write itself was only refused.
+        if let Err(retain_offset_error) =
+            persistence.retain_offset_file(path.to_owned(), file).await
+        {
+            persistence.fail_operation(retain_offset_error, Operation::StoreConsumerOffset);
+            return Err(IggyError::CannotWriteToFile);
         }
+        let Err(offset_written_error) = offset_written_result else {
+            return Ok(());
+        };
+
+        match OffsetWriteFailure::from(&offset_written_error) {
+            // Only the offset file failed, the WAL is fine.
+            OffsetWriteFailure::Refused => warn!(
+                error = %offset_written_error,
+                namespace_raw = self.namespace().inner(),
+                path,
+                "consumer offset write refused, the WAL keeps the op so replay can rewrite the file"
+            ),
+            OffsetWriteFailure::Ambiguous => {
+                persistence.fail_operation(offset_written_error, Operation::StoreConsumerOffset);
+            }
+        }
+        Err(IggyError::CannotWriteToFile)
     }
 
     async fn write_cold_consumer_offset(
@@ -10036,24 +10055,33 @@ mod tests {
         );
     }
 
+    /// When the write fails for some reason other than a full disk, we can't
+    /// tell what ended up in the file, so the WAL stays fenced.
     #[cfg(target_os = "linux")]
     #[compio::test]
     async fn consumer_offset_write_failure_keeps_its_error_kind_and_original_writer() {
+        const EBADF: i32 = 9;
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _) = recording_partition_at(0, 3);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
         partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let path = directory.path().join("consumer-offset");
+        std::fs::write(&path, []).unwrap();
+        let path = path.to_str().unwrap();
+        // Writing through a read-only handle fails with `EBADF`.
+        let read_only = compio::fs::File::open(path).await.unwrap();
+        persistence
+            .retain_offset_file(path.to_owned(), read_only)
+            .await
+            .unwrap();
         assert!(matches!(
-            partition.write_consumer_offset(DEV_FULL, 7, false).await,
+            partition.write_consumer_offset(path, 7, false).await,
             Err(IggyError::CannotWriteToFile)
         ));
-        let persistence = partition.persistence.as_ref().unwrap();
-        assert_eq!(
-            persistence.failure().unwrap().kind(),
-            std::io::ErrorKind::StorageFull
-        );
-        assert!(persistence.take_offset_file(DEV_FULL).is_some());
+        assert_eq!(persistence.failure().unwrap().raw_os_error(), Some(EBADF));
+        assert!(persistence.take_offset_file(path).is_some());
         partition.drive_persistence().await;
         assert!(
             partition.fatal.is_some(),
@@ -16122,7 +16150,7 @@ mod tests {
     /// persist failure cases below inject a fault into one half of the flush
     /// without any production-side plumbing.
     #[cfg(target_os = "linux")]
-    const DEV_FULL: &str = "/dev/full";
+    pub(super) const DEV_FULL: &str = "/dev/full";
 
     const FIRST_PAYLOAD: &[u8] = b"first-chunk";
     const SECOND_PAYLOAD: &[u8] = b"second-chunk-is-longer";
@@ -17215,36 +17243,80 @@ mod purge_poll_tests {
 
 #[cfg(test)]
 mod review_4092_tests {
+    #[cfg(target_os = "linux")]
+    use super::tests::DEV_FULL;
     use super::tests::{checksummed_segment_prepare, recording_partition_at};
     use super::*;
 
-    /// ENOSPC on 28 is the raw errno; `io::ErrorKind::StorageFull` is unstable.
-    const ENOSPC: i32 = 28;
-
-    /// `tick_partitions` turns a partition's `fatal()` into a server shutdown
-    /// (`shard/src/lib.rs:7378-7382`). A refused offset write leaves prior bytes
-    /// intact and nothing undefined, so it should fence the partition at worst,
-    /// the way `mark_materialization_missing` and `partitions.tombstone` already
-    /// do for an unserviceable namespace.
+    /// A refused offset write shouldn't latch the WAL, since nothing in the WAL changed and it
+    /// still has the op. Prepares already on disk must stay written, and new ones must still be
+    /// accepted.
+    #[cfg(target_os = "linux")]
     #[compio::test]
-    #[ignore = "PR #4092 review: a refused consumer-offset write raises `FatalCommit`, which the shard pump converts into a whole-node shutdown"]
-    async fn given_a_full_disk_when_driving_persistence_then_only_the_partition_should_fence() {
+    async fn given_a_full_disk_when_the_offset_write_is_refused_then_persistence_should_not_fence()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut partition, _replies) = recording_partition_at(0, 3);
+        partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+        partition.runtime_options.durability = iggy_common::Durability::Persisted;
+        partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
+        partition.open_persistence().await.unwrap();
+        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
+        let first = checksummed_segment_prepare(1, 0, 0, b"first");
+        let first_header = *first.header();
+        assert!(partition.submit_prepare_persistence(first.into_frozen(), Operation::SendMessages));
+        persistence.drain().await.unwrap();
+        assert!(persistence.is_written(&first_header));
+
+        assert!(matches!(
+            partition.write_consumer_offset(DEV_FULL, 7, false).await,
+            Err(IggyError::CannotWriteToFile)
+        ));
+
+        assert!(
+            persistence.is_written(&first_header),
+            "an unrelated offset write reported an already-durable prepare as unwritten"
+        );
+        assert!(
+            persistence.failure().is_none(),
+            "ENOSPC on one consumer-offset record latched the partition WAL"
+        );
+        assert!(
+            persistence.take_offset_file(DEV_FULL).is_some(),
+            "the offset file must stay open so a later checkpoint still sees its write errors"
+        );
+        let second = checksummed_segment_prepare(2, first_header.checksum, 1, b"second");
+        let second_header = *second.header();
+        assert!(
+            partition.submit_prepare_persistence(second.into_frozen(), Operation::SendMessages),
+            "the WAL stopped accepting prepares after a full-disk offset write"
+        );
+        persistence.drain().await.unwrap();
+        assert!(persistence.is_written(&second_header));
+    }
+
+    /// A refused offset write shouldn't make `drive_persistence` shut down the whole server.
+    /// The commit walk still stops at the op it couldn't apply. That part is covered by
+    /// `given_committed_store_when_offset_persist_fails_should_set_fatal_commit`.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn given_a_full_disk_when_the_offset_write_is_refused_then_driving_persistence_should_not_raise_fatal_commit()
+     {
         let directory = tempfile::tempdir().unwrap();
         let (mut partition, _replies) = recording_partition_at(0, 3);
         partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
         partition.runtime_options.consumer_offset_durability = iggy_common::Durability::Persisted;
         partition.open_persistence().await.unwrap();
-        let persistence = Rc::clone(partition.persistence.as_ref().unwrap());
 
-        persistence.fail_operation(
-            std::io::Error::from_raw_os_error(ENOSPC),
-            Operation::StoreConsumerOffset,
-        );
+        assert!(matches!(
+            partition.write_consumer_offset(DEV_FULL, 7, false).await,
+            Err(IggyError::CannotWriteToFile)
+        ));
         partition.drive_persistence().await;
 
         assert!(
             partition.fatal().is_none(),
-            "a refused consumer-offset write raised FatalCommit, which the shard pump converts into a whole-node shutdown; every other partition on the core is taken down with it, including topics with no persisted policy"
+            "a refused consumer-offset write raised FatalCommit, which the shard pump converts into a whole-node shutdown"
         );
     }
 
