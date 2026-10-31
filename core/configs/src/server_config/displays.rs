@@ -22,6 +22,7 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
+use super::disk::DiskConfig;
 use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
@@ -39,7 +40,7 @@ impl Display for ServerConfig {
              heartbeat: {}, path: {}, runtime: {{ path: {} }}, logging: {}, \
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
-             metadata: {}, message_bus: {}, partition: {}, external_auth: {} }}",
+             metadata: {}, message_bus: {}, partition: {}, external_auth: {}, disk: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -57,6 +58,17 @@ impl Display for ServerConfig {
             self.message_bus,
             self.partition,
             self.external_auth,
+            self.disk,
+        )
+    }
+}
+
+impl Display for DiskConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ usage_limit_enabled: {}, usage_limit_percent: {} }}",
+            self.usage_limit_enabled, self.usage_limit_percent
         )
     }
 }

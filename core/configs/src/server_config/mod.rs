@@ -23,6 +23,7 @@
 
 pub mod cluster;
 pub mod defaults;
+pub mod disk;
 pub mod displays;
 pub mod external_auth;
 pub mod message_bus;

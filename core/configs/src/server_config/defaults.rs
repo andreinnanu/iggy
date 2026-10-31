@@ -16,7 +16,7 @@
 // under the License.
 
 //! `Default` impls for the sections this module owns (`tcp`, `websocket`,
-//! `quic`, `cluster`, `metadata`, `partition`, `message_bus`), sourced
+//! `quic`, `cluster`, `metadata`, `partition`, `message_bus`, `disk`), sourced
 //! from `core/server/config.toml` via [`SERVER_CONFIG`]. Sections drawn
 //! from [`crate::common`] (`http`, `system`, `telemetry`,
 //! `consumer_group`, `data_maintenance`, `personal_access_token`,
@@ -27,6 +27,7 @@ use super::cluster::{
     ClusterAuthConfig, ClusterConfig, ClusterCoordinatorConfig, ClusterNodeConfig,
     ClusterTlsConfig, TransportPorts,
 };
+use super::disk::DiskConfig;
 use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
@@ -54,6 +55,7 @@ impl Default for ServerConfig {
             data_maintenance: DataMaintenanceConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             node: NodeConfig::default(),
+            disk: DiskConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
             path: SERVER_CONFIG.path.to_owned(),
             runtime: Default::default(),
@@ -71,6 +73,15 @@ impl Default for ServerConfig {
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
             external_auth: ExternalAuthConfig::default(),
+        }
+    }
+}
+
+impl Default for DiskConfig {
+    fn default() -> DiskConfig {
+        DiskConfig {
+            usage_limit_enabled: SERVER_CONFIG.disk.usage_limit_enabled,
+            usage_limit_percent: SERVER_CONFIG.disk.usage_limit_percent,
         }
     }
 }

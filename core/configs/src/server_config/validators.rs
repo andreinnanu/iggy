@@ -78,6 +78,9 @@ impl Validatable<ConfigurationError> for ServerConfig {
         self.node.validate().error(|e: &ConfigurationError| {
             format!("{COMPONENT} (error: {e}) - failed to validate node config")
         })?;
+        self.disk.validate().error(|e: &ConfigurationError| {
+            format!("{COMPONENT} (error: {e}) - failed to validate disk config")
+        })?;
         self.validate_tcp_bind_address()?;
         self.validate_client_facing_address()?;
         self.metadata.validate().error(|e: &ConfigurationError| {

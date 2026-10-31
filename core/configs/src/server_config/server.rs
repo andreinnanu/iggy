@@ -17,6 +17,7 @@
 
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
+use super::disk::DiskConfig;
 use super::external_auth::ExternalAuthConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
@@ -177,6 +178,8 @@ pub struct ServerConfig {
     pub data_maintenance: DataMaintenanceConfig,
     #[serde(default)]
     pub node: NodeConfig,
+    #[serde(default)]
+    pub disk: DiskConfig,
     #[serde(default)]
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
@@ -480,6 +483,61 @@ mod tests {
         unsafe { env::remove_var(NAME) };
         let cfg = cfg.expect("config with the env override deserializes");
         assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_disk_usage_limit_env_vars_when_loading_should_override_the_shipped_limit() {
+        let overrides = [
+            ("IGGY_DISK_USAGE_LIMIT_ENABLED", "false"),
+            ("IGGY_DISK_USAGE_LIMIT_PERCENT", "90.5"),
+        ];
+        for (name, value) in overrides {
+            assert!(ServerConfig::all_env_var_names().contains(&name));
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in overrides {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        assert!(!cfg.disk.usage_limit_enabled);
+        assert_eq!(cfg.disk.usage_limit_percent, 90.5);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_nan_disk_usage_limit_env_var_when_validating_should_refuse_the_config() {
+        // The env parser reads numbers with `str::parse::<f64>`, which takes "NaN".
+        const NAME: &str = "IGGY_DISK_USAGE_LIMIT_PERCENT";
+        // SAFETY: `serial_test::serial` keeps other tests off the environment.
+        unsafe { env::set_var(NAME, "NaN") };
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        // SAFETY: paired with the set above.
+        unsafe { env::remove_var(NAME) };
+        let cfg = cfg.expect("NaN parses as a float");
+        assert!(cfg.disk.usage_limit_percent.is_nan());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn given_an_out_of_range_disk_usage_limit_when_validating_should_refuse_the_config() {
+        let mut cfg = ServerConfig::default();
+        cfg.disk.usage_limit_percent = 101.0;
+
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
