@@ -20,8 +20,10 @@
 //! volume holding the data directory.
 
 use arc_swap::ArcSwap;
+use configs::disk::DiskConfig;
+use iggy_common::IggyByteSize;
 use nix::sys::resource::{Resource, getrlimit};
-use server_common::DISK_USAGE;
+use server_common::{DISK_USAGE, VolumeSample};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, OnceLock};
@@ -29,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System as SysinfoSystem;
 use system_stats::{SystemProbe, count_open_files, count_open_files_without_scan};
+use tracing::{info, warn};
 
 /// The last completed process-wide sample. CPU deltas cover the sampler interval.
 /// Slow probes leave the previous sample available without delaying shard readers.
@@ -87,6 +90,10 @@ static HOST_IDENTITY: OnceLock<HostIdentity> = OnceLock::new();
 /// bootstrap.
 static STATS_DATA_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+/// The `[disk]` section, captured once at bootstrap. Unset, the samples carry
+/// no limit.
+static DISK_CONFIG: OnceLock<DiskConfig> = OnceLock::new();
+
 static PUBLISHED_STATS: LazyLock<ArcSwap<SystemStats>> =
     LazyLock::new(|| ArcSwap::from_pointee(SystemStats::default()));
 
@@ -96,6 +103,12 @@ const OPEN_FILES_SCAN_INTERVAL: Duration = Duration::from_secs(10);
 /// Capture the configured data directory before starting the sampler.
 pub fn init_stats_data_path(path: PathBuf) {
     let _ = STATS_DATA_PATH.set(path);
+}
+
+/// Capture the disk usage limit before starting the sampler, which turns it
+/// into bytes on every sample.
+pub fn init_disk_usage_limit(disk: DiskConfig) {
+    let _ = DISK_CONFIG.set(disk);
 }
 
 /// Start one process-lifetime sampler before any shard threads exist.
@@ -112,12 +125,26 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
     let initial = SystemStats::capture(&mut system, 0, true);
     let mut open_files_count = initial.open_files_count;
     PUBLISHED_STATS.store(Arc::new(initial));
+    if DISK_CONFIG
+        .get()
+        .is_some_and(|disk| disk.usage_limit_enabled)
+        && DISK_USAGE.used_bytes().is_none()
+    {
+        warn!(
+            "cannot measure the volume holding the data directory, so the disk usage limit \
+             applies only once a sample succeeds"
+        );
+    }
+    let mut disk_blocked = log_disk_usage_transition(false);
     thread::Builder::new()
         .name("iggy-system-stats".to_owned())
         .spawn(move || {
             let mut last_scan = Instant::now();
             loop {
                 thread::sleep(SYSTEM_STATS_INTERVAL);
+                // A charge may have set the flag since the last sample, and
+                // this sample may clear it again, so look before re-basing.
+                disk_blocked = log_disk_usage_transition(disk_blocked);
                 let scan = last_scan.elapsed() >= scan_interval;
                 let sample = SystemStats::capture(&mut system, open_files_count, scan);
                 open_files_count = sample.open_files_count;
@@ -125,9 +152,33 @@ pub fn start_system_stats_sampler(sysinfo_print_interval: Duration) -> io::Resul
                     last_scan = Instant::now();
                 }
                 PUBLISHED_STATS.store(Arc::new(sample));
+                disk_blocked = log_disk_usage_transition(disk_blocked);
             }
         })
         .map(drop)
+}
+
+/// Logs when the disk usage limit is first seen reached or cleared, and
+/// returns whether it is reached now. Charges set the flag on the shards,
+/// which do not log it, so the sampler reports it, before and after each
+/// sample.
+fn log_disk_usage_transition(was_blocked: bool) -> bool {
+    let blocked = DISK_USAGE.is_blocked();
+    // Only a sample carrying a limit can block, and only a captured config
+    // gives one. That sample also set the estimate.
+    if blocked != was_blocked
+        && let Some(disk) = DISK_CONFIG.get()
+        && let Some(used_bytes) = DISK_USAGE.used_bytes()
+    {
+        let used = IggyByteSize::from(used_bytes);
+        let usage_limit_percent = disk.usage_limit_percent;
+        if blocked {
+            warn!(%used, usage_limit_percent, "disk usage reached [disk] usage_limit_percent");
+        } else {
+            info!(%used, usage_limit_percent, "disk usage is back under [disk] usage_limit_percent");
+        }
+    }
+    blocked
 }
 
 /// Read the last completed sample without filesystem access or a blocking lock.
@@ -145,7 +196,19 @@ impl SystemStats {
             DISK_USAGE.rebase(|| {
                 let stats = fs2::statvfs(path).ok()?;
                 let used_bytes = stats.total_space().saturating_sub(stats.free_space());
-                Some((stats, used_bytes))
+                // What df calls the size: the space a writer without root can
+                // fill, which a volume resize or another ZFS dataset can move.
+                let usable_bytes = used_bytes.saturating_add(stats.available_space());
+                let limit_bytes = DISK_CONFIG
+                    .get()
+                    .and_then(|disk| disk.usage_limit_bytes(usable_bytes));
+                Some((
+                    stats,
+                    VolumeSample {
+                        used_bytes,
+                        limit_bytes,
+                    },
+                ))
             })
         });
         Self {

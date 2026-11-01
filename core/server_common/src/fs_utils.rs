@@ -334,6 +334,7 @@ pub async fn run_blocking<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::VolumeSample;
     use crate::executor::create_shard_executor;
     #[cfg(target_os = "linux")]
     use std::os::unix::fs::FileExt;
@@ -497,7 +498,7 @@ mod tests {
 
         // The volume never held the reservation, so the next sample drops it.
         let sample = 100 * RESERVATION_BYTES;
-        usage.rebase(|| Some(((), sample)));
+        usage.rebase(|| Some(((), VolumeSample::unlimited(sample))));
         assert_eq!(
             usage.used_bytes(),
             Some(sample),

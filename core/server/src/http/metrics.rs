@@ -180,7 +180,11 @@ fn encode_topic_gauge(
 /// Unlike `volume_used_bytes`, it does not move with deletes or with other
 /// processes on the volume.
 ///
-/// Both describe the host's volume, which `/stats` shows only to a user its
+/// `disk_usage_limit_reached` is 1 while the estimate is at or above
+/// `[disk] usage_limit_percent`, and 0 otherwise. Like `volume_used_bytes`,
+/// it is not exported until the first sample.
+///
+/// All three describe the host's volume, which `/stats` shows only to a user its
 /// rule admits, so they live in [`HttpMetrics`]' stats registry.
 ///
 /// It holds the estimate it reads, so a test can export one of its own
@@ -195,6 +199,14 @@ impl Collector for DiskUsageMetrics {
             let metric_encoder = encoder.encode_descriptor(
                 "volume_used_bytes",
                 "estimated bytes used on the volume holding the data directory, as total minus free blocks like df",
+                None,
+                gauge.metric_type(),
+            )?;
+            gauge.encode(metric_encoder)?;
+            let gauge = ConstGauge::new(i64::from(self.0.is_blocked()));
+            let metric_encoder = encoder.encode_descriptor(
+                "disk_usage_limit_reached",
+                "1 while disk usage is at or above [disk] usage_limit_percent, 0 otherwise",
                 None,
                 gauge.metric_type(),
             )?;
@@ -400,6 +412,7 @@ pub(in crate::http) fn gauge_value(count: u64) -> i64 {
 mod tests {
     use super::*;
     use prometheus_client::encoding::text::encode;
+    use server_common::VolumeSample;
     use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 
     const MIB: u64 = 1024 * 1024;
@@ -474,13 +487,17 @@ mod tests {
     }
 
     /// The registry reads the process-wide estimate, which other tests in this
-    /// binary charge too, so this asserts that both series are registered and
+    /// binary charge too, so this asserts that every series is registered and
     /// leaves their values to the tests below.
     #[test]
-    fn registered_metrics_include_both_disk_usage_series() {
-        DISK_USAGE.rebase(|| Some(((), 1)));
+    fn registered_metrics_include_every_disk_usage_series() {
+        DISK_USAGE.rebase(|| Some(((), VolumeSample::unlimited(1))));
         let output = HttpMetrics::init(&[]).formatted_output(true);
-        for series in ["volume_used_bytes gauge", "disk_allocated_bytes counter"] {
+        for series in [
+            "volume_used_bytes gauge",
+            "disk_allocated_bytes counter",
+            "disk_usage_limit_reached gauge",
+        ] {
             assert!(
                 output.contains(&format!("# TYPE {series}\n")),
                 "expected {series} in the exposition:\n{output}"
@@ -503,12 +520,43 @@ mod tests {
             !output.contains("volume_used_bytes"),
             "the estimate must stay hidden until a sample sets its base:\n{output}"
         );
+        assert!(
+            !output.contains("disk_usage_limit_reached"),
+            "the limit cannot be reached before a sample sets it:\n{output}"
+        );
+    }
+
+    #[test]
+    fn given_a_charge_reaching_the_limit_when_encoding_disk_usage_should_report_it_reached() {
+        static USAGE: DiskUsage = DiskUsage::new();
+        USAGE.rebase(|| {
+            Some((
+                (),
+                VolumeSample {
+                    used_bytes: 100 * MIB,
+                    limit_bytes: Some(110 * MIB),
+                },
+            ))
+        });
+        let under = disk_usage_exposition(&USAGE);
+
+        drop(USAGE.charge(10 * MIB));
+        let reached = disk_usage_exposition(&USAGE);
+
+        assert!(
+            under.contains("\ndisk_usage_limit_reached 0\n"),
+            "expected the limit not reached in the exposition:\n{under}"
+        );
+        assert!(
+            reached.contains("\ndisk_usage_limit_reached 1\n"),
+            "expected the limit reached in the exposition:\n{reached}"
+        );
     }
 
     #[test]
     fn given_a_sample_and_a_charge_when_encoding_disk_usage_should_export_both_values() {
         static USAGE: DiskUsage = DiskUsage::new();
-        USAGE.rebase(|| Some(((), 100 * MIB)));
+        USAGE.rebase(|| Some(((), VolumeSample::unlimited(100 * MIB))));
         let sampled = disk_usage_exposition(&USAGE);
 
         drop(USAGE.charge(MIB));
@@ -554,7 +602,7 @@ mod tests {
         );
     }
 
-    /// Both disk usage series of `usage`, encoded as `/metrics` would.
+    /// The disk usage series of `usage`, encoded as `/metrics` would.
     fn disk_usage_exposition(usage: &'static DiskUsage) -> String {
         let mut registry = Registry::default();
         registry.register_collector(Box::new(DiskUsageMetrics(usage)));

@@ -23,49 +23,39 @@ use configs::ConfigEnv;
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, ConfigEnv)]
+#[serde(default, deny_unknown_fields)]
 pub struct DiskConfig {
     /// Whether the server refuses new messages and new consumer offset keys
-    /// above [`Self::usage_limit_percent`].
-    #[serde(default = "default_usage_limit_enabled")]
+    /// at or above [`Self::usage_limit_percent`].
     pub usage_limit_enabled: bool,
     /// Percent of the data volume, counted the way the Use% column of `df`
     /// counts it. Space the filesystem reserves for root is not counted, so
     /// 100 is where a server running without root runs out of space.
-    #[serde(default = "default_usage_limit_percent")]
     pub usage_limit_percent: f64,
-}
-
-fn default_usage_limit_enabled() -> bool {
-    DiskConfig::default().usage_limit_enabled
-}
-
-fn default_usage_limit_percent() -> f64 {
-    DiskConfig::default().usage_limit_percent
 }
 
 impl DiskConfig {
     /// Used bytes at which new data is refused on a volume of `usable_bytes`,
-    /// or `u64::MAX` while the limit is disabled.
+    /// or `None` while the limit is disabled.
     #[must_use]
-    pub fn usage_limit_bytes(&self, usable_bytes: u64) -> u64 {
-        if !self.usage_limit_enabled {
-            return u64::MAX;
-        }
-        // Validation keeps the percent within 0..=100, so the result never
+    pub fn usage_limit_bytes(&self, usable_bytes: u64) -> Option<u64> {
+        // Validation keeps the percent within (0, 100], so the result never
         // exceeds `usable_bytes`. The cast truncates, which errs towards a
         // fuller disk.
-        (usable_bytes as f64 * self.usage_limit_percent / 100.0) as u64
+        self.usage_limit_enabled
+            .then(|| (usable_bytes as f64 * self.usage_limit_percent / 100.0) as u64)
     }
 }
 
 impl Validatable<ConfigurationError> for DiskConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
-        // NaN and both infinities fall outside the range too.
-        if !(0.0..=100.0).contains(&self.usage_limit_percent) {
+        // Written so that NaN fails it too. 0 would refuse every write, so it
+        // is refused here and `usage_limit_enabled = false` turns the limit off.
+        if !(self.usage_limit_percent > 0.0 && self.usage_limit_percent <= 100.0) {
             eprintln!(
-                "{COMPONENT} disk.usage_limit_percent ({}) must be >= 0 and <= 100",
+                "{COMPONENT} disk.usage_limit_percent ({}) must be > 0 and <= 100. Set \
+                 disk.usage_limit_enabled = false to turn the limit off",
                 self.usage_limit_percent
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
@@ -104,7 +94,7 @@ mod tests {
 
     #[test]
     fn validate_accepts_the_bounds_and_fractions() {
-        for usage_limit_percent in [0.0, -0.0, 90.5, 100.0] {
+        for usage_limit_percent in [0.0001, 90.5, 100.0] {
             assert!(
                 limited_at(usage_limit_percent).validate().is_ok(),
                 "usage_limit_percent = {usage_limit_percent} must be accepted"
@@ -115,6 +105,8 @@ mod tests {
     #[test]
     fn validate_rejects_out_of_range_and_non_finite_percents() {
         for usage_limit_percent in [
+            0.0,
+            -0.0,
             -1.0,
             100.000_001,
             f64::NAN,
@@ -143,21 +135,26 @@ mod tests {
         // 469.06 GiB, a volume of 491.08 GiB minus 22.02 GiB reserved for root.
         const USABLE: u64 = 503_662_575_616;
 
-        assert_eq!(limited_at(90.0).usage_limit_bytes(1000), 900);
-        assert_eq!(limited_at(90.5).usage_limit_bytes(USABLE), 455_814_630_932);
-        assert_eq!(limited_at(0.0).usage_limit_bytes(USABLE), 0);
-        assert_eq!(limited_at(100.0).usage_limit_bytes(USABLE), USABLE);
-        assert_eq!(limited_at(100.0).usage_limit_bytes(u64::MAX), u64::MAX);
+        assert_eq!(limited_at(90.0).usage_limit_bytes(1000), Some(900));
+        assert_eq!(
+            limited_at(90.5).usage_limit_bytes(USABLE),
+            Some(455_814_630_932)
+        );
+        assert_eq!(limited_at(100.0).usage_limit_bytes(USABLE), Some(USABLE));
+        assert_eq!(
+            limited_at(100.0).usage_limit_bytes(u64::MAX),
+            Some(u64::MAX)
+        );
     }
 
     #[test]
-    fn usage_limit_bytes_is_unreachable_while_the_limit_is_disabled() {
+    fn usage_limit_bytes_is_none_while_the_limit_is_disabled() {
         let config = DiskConfig {
             usage_limit_enabled: false,
             ..limited_at(90.0)
         };
 
-        assert_eq!(config.usage_limit_bytes(1000), u64::MAX);
+        assert_eq!(config.usage_limit_bytes(1000), None);
     }
 
     #[test]
