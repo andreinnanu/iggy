@@ -2116,6 +2116,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_full_disk_when_sending_should_fail_once_without_retrying() {
+        let (cluster, producer) = connected_producer().await;
+        cluster.script(
+            &endpoint(0),
+            SEND_MESSAGES_CODE,
+            [Answer::Refuse(IggyError::DiskUsageLimitReached)],
+        );
+
+        let Err(IggyError::ProducerSendFailed { cause, failed, .. }) =
+            producer.send(vec![message(b"full")]).await
+        else {
+            panic!("the producer must return the refused chunk");
+        };
+
+        assert_eq!(*cause, IggyError::DiskUsageLimitReached);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            cluster.count(SEND_MESSAGES_CODE),
+            1,
+            "only freed space reopens the gate, so a retry cannot succeed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_a_partial_send_when_a_new_call_recovers_should_replay_only_the_uncertain_chunk()
     {
         let (cluster, producer) = connected_producer().await;

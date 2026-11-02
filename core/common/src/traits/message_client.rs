@@ -70,7 +70,8 @@ pub trait MessageClient {
     /// read, in one round trip. While the primary stays up a message is delivered at most once.
     /// A failover before the store replicates can deliver the last batch again. A new offset key
     /// can be refused with `TooManyConsumerOffsets` at the configured limit of the partition,
-    /// and that poll returns no messages.
+    /// or with `DiskUsageLimitReached` (4109) while the data volume is at or above
+    /// `[disk] usage_limit_percent`, and that poll returns no messages.
     ///
     /// An `OnRead` call whose outcome is unknown fails with
     /// [`IggyError::FetchProgressUncertain`] naming its operation, never with
@@ -138,6 +139,10 @@ pub trait MessageClient {
     /// implies uniqueness. Confirmation follows VSR quorum commit. Persisted
     /// message durability also requires recoverable stable-storage copies on
     /// the quorum.
+    ///
+    /// While the data volume of the partition primary is at or above
+    /// `[disk] usage_limit_percent`, the send is refused with
+    /// `DiskUsageLimitReached` (4109) and not retried.
     ///
     /// Binary clients refresh the partition context once after a definitive
     /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send

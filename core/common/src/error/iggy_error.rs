@@ -541,6 +541,11 @@ pub enum IggyError {
     UnsupportedCriticalOption(String) = 4107,
     #[error("Cannot modify root user")]
     CannotModifyRootUser = 4108,
+    /// The data volume is at or above `[disk] usage_limit_percent`, so the
+    /// partition primary refuses new messages and new consumer offset keys.
+    /// Retrying does not help until space is freed.
+    #[error("Disk usage limit reached, free space or raise [disk] usage_limit_percent")]
+    DiskUsageLimitReached = 4109,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]
@@ -794,6 +799,15 @@ mod tests {
         assert_eq!(error.as_code(), 3024);
         assert_eq!(IggyError::from_code(3024), error);
         assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
+    }
+
+    #[test]
+    fn disk_usage_limit_reached_round_trips_by_code() {
+        let error = IggyError::DiskUsageLimitReached;
+        assert_eq!(error.as_code(), 4109);
+        assert_eq!(IggyError::from_code(4109), error);
+        assert_eq!(error.as_string(), "disk_usage_limit_reached");
+        assert_eq!(IggyError::from_code_as_string(4109), error.as_string());
     }
 
     #[test]

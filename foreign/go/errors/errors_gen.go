@@ -2355,6 +2355,17 @@ func (e CannotModifyRootUser) Is(target error) bool {
 	return ok
 }
 
+type DiskUsageLimitReached struct{}
+
+func (e DiskUsageLimitReached) Error() string {
+	return "disk usage limit reached, free space or raise [disk] usage_limit_percent"
+}
+func (e DiskUsageLimitReached) Code() Code { return 4109 }
+func (e DiskUsageLimitReached) Is(target error) bool {
+	_, ok := target.(DiskUsageLimitReached)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -3120,6 +3131,7 @@ var (
 	ErrStreamEncryptionUnavailable                = StreamEncryptionUnavailable{}
 	ErrUnsupportedCriticalOption                  = UnsupportedCriticalOption{}
 	ErrCannotModifyRootUser                       = CannotModifyRootUser{}
+	ErrDiskUsageLimitReached                      = DiskUsageLimitReached{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3386,6 +3398,7 @@ const (
 	StreamEncryptionUnavailableCode                Code = 4106
 	UnsupportedCriticalOptionCode                  Code = 4107
 	CannotModifyRootUserCode                       Code = 4108
+	DiskUsageLimitReachedCode                      Code = 4109
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3861,6 +3874,8 @@ func (c Code) String() string {
 		return "UnsupportedCriticalOption"
 	case CannotModifyRootUserCode:
 		return "CannotModifyRootUser"
+	case DiskUsageLimitReachedCode:
+		return "DiskUsageLimitReached"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -4390,6 +4405,8 @@ func FromCode(code Code) IggyError {
 		return ErrUnsupportedCriticalOption
 	case CannotModifyRootUserCode:
 		return ErrCannotModifyRootUser
+	case DiskUsageLimitReachedCode:
+		return ErrDiskUsageLimitReached
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:

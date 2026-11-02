@@ -77,6 +77,9 @@ impl IntoResponse for CustomError {
                     | IggyError::InvalidPersonalAccessToken => StatusCode::UNAUTHORIZED,
                     IggyError::Unauthorized => StatusCode::FORBIDDEN,
                     IggyError::PartitionHistoryChanged => StatusCode::CONFLICT,
+                    // Not retryable within a Retry-After: only freed space
+                    // reopens the gate, so no hint rides along.
+                    IggyError::DiskUsageLimitReached => StatusCode::INSUFFICIENT_STORAGE,
                     // Stored state this build cannot read, not a caller error.
                     IggyError::UnsupportedCriticalOption(_) => StatusCode::INTERNAL_SERVER_ERROR,
                     // The write path ran out of replays of a request id whose
@@ -950,6 +953,22 @@ mod tests {
         let error: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(error["id"], 58);
         assert_eq!(error["code"], "transient_not_accepted");
+    }
+
+    #[tokio::test]
+    async fn disk_usage_limit_reached_renders_507_without_retry_after() {
+        const ERROR_BODY_LIMIT: usize = 1024;
+        let response =
+            PartitionWriteError::Rejected(IggyError::DiskUsageLimitReached).into_response();
+
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(!response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), ERROR_BODY_LIMIT)
+            .await
+            .unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], 4109);
+        assert_eq!(error["code"], "disk_usage_limit_reached");
     }
 
     #[test]

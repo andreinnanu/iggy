@@ -44,7 +44,9 @@ pub trait ConsumerOffsetClient {
     /// Authentication and permission to poll messages are required.
     /// Returns [`IggyError::HistoryUnavailable`] (87) for a deleted or replaced incarnation,
     /// [`IggyError::ConsumerGroupPartitionNotOwned`] (5009) for a lost owner,
-    /// or [`IggyError::TooManyConsumerOffsets`] (3024) at the new-key limit.
+    /// [`IggyError::TooManyConsumerOffsets`] (3024) at the new-key limit, or
+    /// [`IggyError::DiskUsageLimitReached`] (4109) for a new key while the data
+    /// volume is at or above `[disk] usage_limit_percent`.
     async fn store_consumer_position(
         &self,
         consumer: &Consumer,
@@ -57,6 +59,8 @@ pub trait ConsumerOffsetClient {
     ///
     /// Authentication is required, and the permission to poll the messages.
     /// A new key at the per-partition limit returns [`IggyError::TooManyConsumerOffsets`] (3024).
+    /// A new key while the data volume is at or above `[disk] usage_limit_percent`
+    /// returns [`IggyError::DiskUsageLimitReached`] (4109). Existing keys stay writable.
     async fn store_consumer_offset(
         &self,
         consumer: &Consumer,

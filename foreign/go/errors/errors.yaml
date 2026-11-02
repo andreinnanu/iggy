@@ -1133,6 +1133,10 @@
   code: 4108
   format: "cannot modify root user"
   fields: []
+- name: DiskUsageLimitReached
+  code: 4109
+  format: "disk usage limit reached, free space or raise [disk] usage_limit_percent"
+  fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000
   format: "consumer group with id: %d for topic with id: %d was not found."

@@ -240,6 +240,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case streamEncryptionUnavailable = 4106
     case unsupportedCriticalOption = 4107
     case cannotModifyRootUser = 4108
+    case diskUsageLimitReached = 4109
     case consumerGroupIdNotFound = 5000
     case invalidConsumerGroupId = 5002
     case consumerGroupNameNotFound = 5003
@@ -513,6 +514,7 @@ extension IggyErrorCode {
         case .streamEncryptionUnavailable: "stream_encryption_unavailable"
         case .unsupportedCriticalOption: "unsupported_critical_option"
         case .cannotModifyRootUser: "cannot_modify_root_user"
+        case .diskUsageLimitReached: "disk_usage_limit_reached"
         case .consumerGroupIdNotFound: "consumer_group_id_not_found"
         case .invalidConsumerGroupId: "invalid_consumer_group_id"
         case .consumerGroupNameNotFound: "consumer_group_name_not_found"
