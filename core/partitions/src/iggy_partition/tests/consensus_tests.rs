@@ -253,7 +253,7 @@ async fn committed_pipeline_entries_allow_another_clients_write_before_receipt_f
     );
 }
 
-fn send_request_for_client(
+pub(super) fn send_request_for_client(
     namespace: IggyNamespace,
     client_id: u128,
 ) -> Message<RoutedRequestHeader> {

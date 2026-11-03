@@ -1872,6 +1872,7 @@ async fn partition_with_pending_durable_ack() -> (
 mod consensus_tests;
 mod consumer_group_ownership;
 mod disk_poll;
+mod disk_usage_limit;
 mod empty_offsets;
 mod history;
 mod materialization;

@@ -90,7 +90,7 @@ use journal::superblock::{
 use message_bus::{AUTO_COMMIT_CLIENT_ID, IggyMessageBus, MessageBus, is_auto_commit_client};
 use server_common::poll::{AutoCommitReservation, PollHistoryId};
 use server_common::{
-    Message, SegmentStorage,
+    DISK_USAGE, DiskUsage, Message, SegmentStorage,
     iobuf::Frozen,
     send_messages::{
         BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
@@ -347,6 +347,9 @@ where
     /// Newest retirement debt op this replica learned from local metadata.
     /// While it exceeds `retirement_paid_through`, session requests wait.
     retirement_debt: Cell<u64>,
+    /// The estimate whose flag refuses new data at admission. Tests give a
+    /// partition its own, so blocking it leaves other tests' partitions open.
+    disk_usage: &'static DiskUsage,
     /// Durable superblock for this partition's consensus group, recording
     /// `(view, log_view)` across a crash so this replica can never
     /// re-participate in a view older than one it advertised. `None` for
@@ -1007,6 +1010,7 @@ where
             required_metadata_frontier: 0,
             retirement_paid_through: 0,
             retirement_debt: Cell::new(0),
+            disk_usage: &DISK_USAGE,
             superblock: None,
             superblock_lock: Rc::new(LocalGate::new()),
             superblock_intent: Cell::new(None),
@@ -1541,6 +1545,11 @@ where
         for capacity in &self.consumer_offset_capacities {
             capacity.set_limit(offsets_max);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn set_disk_usage(&mut self, disk_usage: &'static DiskUsage) {
+        self.disk_usage = disk_usage;
     }
 
     #[must_use]
@@ -4636,6 +4645,7 @@ where
             return Err(IggyError::TransientNotAccepted);
         }
 
+        self.disk_admission(Operation::StoreConsumerOffset, Some((kind, consumer_id)))?;
         let reservation = self
             .consumer_offset_capacity_for(kind)
             .reserve_provisional(consumer_id, &self.durable_consumer_offsets)
@@ -5508,6 +5518,36 @@ where
         kind: ConsumerKind,
     ) -> &ConsumerOffsetCapacity {
         &self.consumer_offset_capacities[kind.index()]
+    }
+
+    /// New messages, and offset keys that would create a file, wait for space
+    /// a sample sees freed. Everything that frees space or rewrites in place
+    /// passes, and so does an offset store whose key is not known yet.
+    fn disk_admission(
+        &self,
+        operation: Operation,
+        offset_key: Option<(ConsumerKind, u32)>,
+    ) -> Result<(), IggyError> {
+        if !self.disk_usage.is_blocked() {
+            return Ok(());
+        }
+        match (operation, offset_key) {
+            (Operation::SendMessages, _) => Err(IggyError::DiskUsageLimitReached),
+            (Operation::StoreConsumerOffset, Some((kind, consumer_id)))
+                if !self.holds_consumer_offset_key(kind, consumer_id) =>
+            {
+                Err(IggyError::DiskUsageLimitReached)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// A key counts as held once it is durable, or once an admitted store for
+    /// it is in flight, since that store already allocates its file.
+    fn holds_consumer_offset_key(&self, kind: ConsumerKind, consumer_id: u32) -> bool {
+        let capacity = self.consumer_offset_capacity_for(kind);
+        capacity.holds(consumer_id, &self.durable_consumer_offsets)
+            || capacity.is_stranded(consumer_id)
     }
 
     /// Whether `kind` holds `consumer_id`: the live map of a polled kind, or the
@@ -8175,6 +8215,20 @@ where
                 .await;
                 return;
             }
+            if let Err(error) = self.disk_admission(
+                message.header().operation,
+                consumer_offset.map(|(kind, consumer_id, _, _)| (kind, consumer_id)),
+            ) {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    error.as_code(),
+                    "disk usage limit reply failed",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
 
             let offset_blocked = consumer_offset.is_some_and(|(kind, id, offset, _)| {
                 self.consumer_offset_is_blocked(kind, id, offset, true)
@@ -8518,6 +8572,22 @@ where
                 }
                 continue;
             }
+            // Offset keys are checked below, once the request is parsed.
+            if let Err(error) = self.disk_admission(header.operation, None) {
+                if self
+                    .deny_queued_request(
+                        &header,
+                        error.as_code(),
+                        "queued request refused at the disk usage limit",
+                        reply_sender.take(),
+                        &mut consecutive_denials,
+                    )
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             if let Some(parsed) = offset_request {
                 let (kind, consumer_id, offset, _) = match parsed {
                     Ok(parsed) => parsed,
@@ -8573,6 +8643,24 @@ where
                             &header,
                             error.as_code(),
                             "queued consumer offset validation reply failed",
+                            reply_sender.take(),
+                            &mut consecutive_denials,
+                        )
+                        .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
+                if offset.is_some()
+                    && let Err(error) =
+                        self.disk_admission(header.operation, Some((kind, consumer_id)))
+                {
+                    if self
+                        .deny_queued_request(
+                            &header,
+                            error.as_code(),
+                            "queued offset key refused at the disk usage limit",
                             reply_sender.take(),
                             &mut consecutive_denials,
                         )

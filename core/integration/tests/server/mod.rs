@@ -87,6 +87,9 @@ mod descriptor_exhaustion_vsr;
 // The disk usage estimate stays within a stated bound of statvfs, and a
 // sample picks up writes the server cannot charge.
 mod disk_usage;
+// Over the disk usage limit, the server refuses new messages and new offset
+// keys and keeps serving reads, existing offsets and deletes.
+mod disk_usage_limit;
 mod general;
 mod partitions_limit_vsr;
 // The expired-token cleaner deletes under the reserved client id, and later

@@ -1089,6 +1089,13 @@ impl TestBinary for ServerHandle {
         {
             command.env("IGGY_SHARD_RUNTIME_CAPACITY", "256");
         }
+        // A nearly full test machine would refuse every write at the shipped
+        // disk usage limit, so tests run without it unless they set it.
+        if !self.envs.contains_key("IGGY_DISK_USAGE_LIMIT_ENABLED")
+            && std::env::var("IGGY_DISK_USAGE_LIMIT_ENABLED").is_err()
+        {
+            command.env("IGGY_DISK_USAGE_LIMIT_ENABLED", "false");
+        }
         // An explicit config-level override must be the test's logging
         // contract. The server gives `RUST_LOG` precedence, so inheriting an
         // ambient value could silently filter out markers the test asserts.
